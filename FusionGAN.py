@@ -1,0 +1,343 @@
+import os
+import cv2
+import tensorflow as tf
+
+import core.common as common
+import core.utils as utils
+import core.backbone as backbone
+from core.config import cfg
+import numpy as np
+from core.dataset import Dataset
+from tqdm import tqdm
+from skimage import transform,data
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+image_width = 320
+image_height = 256
+
+epochs = 400
+#batch_size = 2
+#train_size = 7090
+#train_tfrecord = "images_train.tfrecord"
+
+
+def read_and_decode(serialized_example):
+    features = tf.compat.v1.parse_single_example(serialized_example, features={
+        "image_ir":tf.compat.v1.FixedLenFeature([], tf.compat.v1.string),
+        "image_vi":tf.compat.v1.FixedLenFeature([], tf.compat.v1.string),
+        "filename":tf.compat.v1.FixedLenFeature([], tf.compat.v1.string)})
+    images_ir = tf.decode_raw(features["image_ir"], tf.uint8)
+    images_ir = tf.reshape(images_ir, [image_height, image_width, 3])
+    images_vi = tf.decode_raw(features["image_vi"], tf.uint8)
+    images_vi = tf.reshape(images_vi, [image_height, image_width, 3])
+    filename = tf.compat.v1.cast(features["filename"], tf.compat.v1.string)
+    return images_ir, images_vi, filename
+
+
+def gradient(input):
+    filter = tf.reshape(tf.constant([[0.,1.,0.], [1.,-4.,1.], [0.,1.,0.]]), [3,3,1,1])
+    d = tf.nn.conv2d(input, filter, strides=[1,1,1,1], padding='SAME')
+    return d
+
+
+def generator(x,reuse=False):
+    with tf.compat.v1.variable_scope('Generator', reuse=reuse):
+        x = tf.layers.conv2d(x, 256, 5, padding='same')
+        x = tf.nn.relu(x)
+        x = tf.layers.conv2d(x, 128, 5, padding='same')
+        x = tf.nn.relu(x)
+        x = tf.layers.conv2d(x, 64, 3, padding='same')
+        x = tf.nn.relu(x)
+        x = tf.layers.conv2d(x, 32, 3, padding='same')
+        x = tf.nn.relu(x)
+        x = tf.layers.conv2d(x, 1, 1, padding='same')
+        x = tf.nn.sigmoid(x)
+        return x
+
+
+def discriminator1(x, reuse=False):
+    with tf.compat.v1.variable_scope('Discriminator1', reuse=reuse):
+        x = tf.layers.conv2d(x, 32, 5, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.layers.conv2d(x, 64, 5, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.layers.conv2d(x, 128, 3, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.layers.conv2d(x, 256, 3, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.contrib.layers.flatten(x)
+        x = tf.layers.dense(x, 1024)
+        x = tf.nn.tanh(x)
+        x = tf.layers.dense(x, 2)
+    return x
+def discriminator2(x, reuse=False):
+    with tf.compat.v1.variable_scope('Discriminator2', reuse=reuse):
+        x = tf.layers.conv2d(x, 32, 5, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.layers.conv2d(x, 64, 5, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.layers.conv2d(x, 128, 3, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.layers.conv2d(x, 256, 3, padding="same")
+        x = tf.nn.tanh(x)
+        x = tf.layers.average_pooling2d(x, 2, 2, padding="same")
+        x = tf.contrib.layers.flatten(x)
+        x = tf.layers.dense(x, 1024)
+        x = tf.nn.tanh(x)
+        x = tf.layers.dense(x, 2)
+    return x
+
+class YOLOV3(object):
+    """Implement tensoflow yolov3 here"""
+    def __init__(self, input_data, trainable):
+
+        self.trainable        = trainable
+        self.classes          = utils.read_class_names(cfg.YOLO.CLASSES)
+        self.num_class        = len(self.classes)
+        self.strides          = np.array(cfg.YOLO.STRIDES)
+        self.anchors          = utils.get_anchors(cfg.YOLO.ANCHORS)
+        self.anchor_per_scale = cfg.YOLO.ANCHOR_PER_SCALE
+        self.iou_loss_thresh  = cfg.YOLO.IOU_LOSS_THRESH
+        self.upsample_method  = cfg.YOLO.UPSAMPLE_METHOD
+
+        try:
+            self.conv_lbbox, self.conv_mbbox, self.conv_sbbox = self.build_network(input_data)
+        except:
+            raise NotImplementedError("Can not build up yolov3 network!")
+
+        with tf.variable_scope('pred_sbbox'):
+            self.pred_sbbox = self.decode(self.conv_sbbox, self.anchors[0], self.strides[0])
+
+        with tf.variable_scope('pred_mbbox'):
+            self.pred_mbbox = self.decode(self.conv_mbbox, self.anchors[1], self.strides[1])
+
+        with tf.variable_scope('pred_lbbox'):
+            self.pred_lbbox = self.decode(self.conv_lbbox, self.anchors[2], self.strides[2])
+
+    def build_network(self, input_data):
+        with tf.compat.v1.variable_scope('D-yolo',reuse=tf.AUTO_REUSE):
+
+            route_1, route_2, input_data = backbone.darknet53(input_data, self.trainable)
+    
+            input_data = common.convolutional(input_data, (1, 1, 1024,  512), self.trainable, 'conv52')
+            input_data = common.convolutional(input_data, (3, 3,  512, 1024), self.trainable, 'conv53')
+            input_data = common.convolutional(input_data, (1, 1, 1024,  512), self.trainable, 'conv54')
+            input_data = common.convolutional(input_data, (3, 3,  512, 1024), self.trainable, 'conv55')
+            input_data = common.convolutional(input_data, (1, 1, 1024,  512), self.trainable, 'conv56')
+    
+            conv_lobj_branch = common.convolutional(input_data, (3, 3, 512, 1024), self.trainable, name='conv_lobj_branch')
+            conv_lbbox = common.convolutional(conv_lobj_branch, (1, 1, 1024, 3*(self.num_class + 5)),
+                                              trainable=self.trainable, name='conv_lbbox', activate=False, bn=False)
+    
+            input_data = common.convolutional(input_data, (1, 1,  512,  256), self.trainable, 'conv57')
+            input_data = common.upsample(input_data, name='upsample0', method=self.upsample_method)
+    
+            with tf.variable_scope('route_1'):
+                input_data = tf.concat([input_data, route_2], axis=-1)
+    
+            input_data = common.convolutional(input_data, (1, 1, 768, 256), self.trainable, 'conv58')
+            input_data = common.convolutional(input_data, (3, 3, 256, 512), self.trainable, 'conv59')
+            input_data = common.convolutional(input_data, (1, 1, 512, 256), self.trainable, 'conv60')
+            input_data = common.convolutional(input_data, (3, 3, 256, 512), self.trainable, 'conv61')
+            input_data = common.convolutional(input_data, (1, 1, 512, 256), self.trainable, 'conv62')
+    
+            conv_mobj_branch = common.convolutional(input_data, (3, 3, 256, 512),  self.trainable, name='conv_mobj_branch' )
+            conv_mbbox = common.convolutional(conv_mobj_branch, (1, 1, 512, 3*(self.num_class + 5)),
+                                              trainable=self.trainable, name='conv_mbbox', activate=False, bn=False)
+    
+            input_data = common.convolutional(input_data, (1, 1, 256, 128), self.trainable, 'conv63')
+            input_data = common.upsample(input_data, name='upsample1', method=self.upsample_method)
+    
+            with tf.variable_scope('route_2'):
+                input_data = tf.concat([input_data, route_1], axis=-1)
+    
+            input_data = common.convolutional(input_data, (1, 1, 384, 128), self.trainable, 'conv64')
+            input_data = common.convolutional(input_data, (3, 3, 128, 256), self.trainable, 'conv65')
+            input_data = common.convolutional(input_data, (1, 1, 256, 128), self.trainable, 'conv66')
+            input_data = common.convolutional(input_data, (3, 3, 128, 256), self.trainable, 'conv67')
+            input_data = common.convolutional(input_data, (1, 1, 256, 128), self.trainable, 'conv68')
+    
+            conv_sobj_branch = common.convolutional(input_data, (3, 3, 128, 256), self.trainable, name='conv_sobj_branch')
+            conv_sbbox = common.convolutional(conv_sobj_branch, (1, 1, 256, 3*(self.num_class + 5)),
+                                              trainable=self.trainable, name='conv_sbbox', activate=False, bn=False)
+    
+            return conv_lbbox, conv_mbbox, conv_sbbox
+
+    def decode(self, conv_output, anchors, stride):
+        """
+        return tensor of shape [batch_size, output_size, output_size, anchor_per_scale, 5 + num_classes]
+               contains (x, y, w, h, score, probability)
+        """
+
+        conv_shape       = tf.shape(conv_output)
+        batch_size       = conv_shape[0]
+        output_sizex      = conv_shape[1]
+        output_sizey      = conv_shape[2]
+        anchor_per_scale = len(anchors)
+
+        conv_output = tf.reshape(conv_output, (batch_size, output_sizex, output_sizey, anchor_per_scale, 5 + self.num_class))
+
+        conv_raw_dxdy = conv_output[:, :, :, :, 0:2]
+        conv_raw_dwdh = conv_output[:, :, :, :, 2:4]
+        conv_raw_conf = conv_output[:, :, :, :, 4:5]
+        conv_raw_prob = conv_output[:, :, :, :, 5: ]
+
+        y = tf.tile(tf.range(output_sizex, dtype=tf.int32)[:, tf.newaxis], [1, output_sizey])
+        x = tf.tile(tf.range(output_sizey, dtype=tf.int32)[tf.newaxis, :], [output_sizex ,1])
+
+        xy_grid = tf.concat([x[:, :, tf.newaxis], y[:, :, tf.newaxis]], axis=-1)
+        xy_grid = tf.tile(xy_grid[tf.newaxis, :, :, tf.newaxis, :], [batch_size, 1, 1, anchor_per_scale, 1])
+        xy_grid = tf.cast(xy_grid, tf.float32)
+
+        pred_xy = (tf.sigmoid(conv_raw_dxdy) + xy_grid) * stride
+        pred_wh = (tf.exp(conv_raw_dwdh) * anchors) * stride
+        pred_xywh = tf.concat([pred_xy, pred_wh], axis=-1)
+
+        pred_conf = tf.sigmoid(conv_raw_conf)
+        pred_prob = tf.sigmoid(conv_raw_prob)
+
+        return tf.concat([pred_xywh, pred_conf, pred_prob], axis=-1)
+
+    def focal(self, target, actual, alpha=1, gamma=2):
+        focal_loss = alpha * tf.pow(tf.abs(target - actual), gamma)
+        return focal_loss
+
+    def bbox_giou(self, boxes1, boxes2):
+
+        boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
+                            boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
+        boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
+                            boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
+
+        boxes1 = tf.concat([tf.minimum(boxes1[..., :2], boxes1[..., 2:]),
+                            tf.maximum(boxes1[..., :2], boxes1[..., 2:])], axis=-1)
+        boxes2 = tf.concat([tf.minimum(boxes2[..., :2], boxes2[..., 2:]),
+                            tf.maximum(boxes2[..., :2], boxes2[..., 2:])], axis=-1)
+
+        boxes1_area = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
+        boxes2_area = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+
+        left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])
+        right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])
+
+        inter_section = tf.maximum(right_down - left_up, 0.0)
+        inter_area = inter_section[..., 0] * inter_section[..., 1]
+        union_area = boxes1_area + boxes2_area - inter_area
+        iou = inter_area / (union_area + 1e-6)
+        # added 1e-6 in denominator to avoid generation of inf, which may cause nan loss
+
+        enclose_left_up = tf.minimum(boxes1[..., :2], boxes2[..., :2])
+        enclose_right_down = tf.maximum(boxes1[..., 2:], boxes2[..., 2:])
+        enclose = tf.maximum(enclose_right_down - enclose_left_up, 0.0)
+        enclose_area = enclose[..., 0] * enclose[..., 1]
+        giou = iou - 1.0 * (enclose_area - union_area) / (enclose_area + 1e-6)
+        # added 1e-6 in denominator to avoid generation of inf, which may cause nan loss
+
+        return giou
+
+    def bbox_iou(self, boxes1, boxes2):
+
+        boxes1_area = boxes1[..., 2] * boxes1[..., 3]
+        boxes2_area = boxes2[..., 2] * boxes2[..., 3]
+
+        boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
+                            boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
+        boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
+                            boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
+
+        left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])
+        right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])
+
+        inter_section = tf.maximum(right_down - left_up, 0.0)
+        inter_area = inter_section[..., 0] * inter_section[..., 1]
+        union_area = boxes1_area + boxes2_area - inter_area
+        iou = 1.0 * inter_area / union_area
+
+        return iou
+
+    def loss_layer(self, conv, pred, label, bboxes, anchors, stride):
+
+        conv_shape  = tf.shape(conv)
+        batch_size  = conv_shape[0]
+        output_sizex = conv_shape[1]
+        output_sizey = conv_shape[2]
+        input_sizex  = stride * output_sizex
+        input_sizey  = stride * output_sizey
+        conv = tf.reshape(conv, (batch_size, output_sizex, output_sizey,
+                                 self.anchor_per_scale, 5 + self.num_class))
+        conv_raw_conf = conv[:, :, :, :, 4:5]
+        conv_raw_prob = conv[:, :, :, :, 5:]
+
+        pred_xywh     = pred[:, :, :, :, 0:4]
+        pred_conf     = pred[:, :, :, :, 4:5]
+
+        label_xywh    = label[:, :, :, :, 0:4]
+        respond_bbox  = label[:, :, :, :, 4:5]
+        label_prob    = label[:, :, :, :, 5:]
+
+        giou = tf.expand_dims(self.bbox_giou(pred_xywh, label_xywh), axis=-1)
+        input_sizex = tf.cast(input_sizex, tf.float32)
+        input_sizey = tf.cast(input_sizey, tf.float32)
+        bbox_loss_scale = 2.0 - 1.0 * label_xywh[:, :, :, :, 2:3] * label_xywh[:, :, :, :, 3:4] / (input_sizex*input_sizey)
+        giou_loss = respond_bbox * bbox_loss_scale * (1- giou)
+
+        iou = self.bbox_iou(pred_xywh[:, :, :, :, np.newaxis, :], bboxes[:, np.newaxis, np.newaxis, np.newaxis, :, :])
+        max_iou = tf.expand_dims(tf.reduce_max(iou, axis=-1), axis=-1)
+
+        respond_bgd = (1.0 - respond_bbox) * tf.cast( max_iou < self.iou_loss_thresh, tf.float32 )
+
+        conf_focal = self.focal(respond_bbox, pred_conf)
+
+        conf_loss = conf_focal * (
+                respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=respond_bbox, logits=conv_raw_conf)
+                +
+                respond_bgd * tf.nn.sigmoid_cross_entropy_with_logits(labels=respond_bbox, logits=conv_raw_conf)
+        )
+
+        prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_prob, logits=conv_raw_prob)
+
+        giou_loss = tf.reduce_mean(tf.reduce_sum(giou_loss, axis=[1,2,3,4]))
+        conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1,2,3,4]))
+        prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1,2,3,4]))
+
+        return giou_loss, conf_loss, prob_loss
+
+
+
+    def compute_loss(self, label_sbbox, label_mbbox, label_lbbox, true_sbbox, true_mbbox, true_lbbox):
+
+        with tf.name_scope('smaller_box_loss'):
+            loss_sbbox = self.loss_layer(self.conv_sbbox, self.pred_sbbox, label_sbbox, true_sbbox,
+                                         anchors = self.anchors[0], stride = self.strides[0])
+
+        with tf.name_scope('medium_box_loss'):
+            loss_mbbox = self.loss_layer(self.conv_mbbox, self.pred_mbbox, label_mbbox, true_mbbox,
+                                         anchors = self.anchors[1], stride = self.strides[1])
+
+        with tf.name_scope('bigger_box_loss'):
+            loss_lbbox = self.loss_layer(self.conv_lbbox, self.pred_lbbox, label_lbbox, true_lbbox,
+                                         anchors = self.anchors[2], stride = self.strides[2])
+
+        with tf.name_scope('giou_loss'):
+            giou_loss = loss_sbbox[0] + loss_mbbox[0] + loss_lbbox[0]
+
+        with tf.name_scope('conf_loss'):
+            conf_loss = loss_sbbox[1] + loss_mbbox[1] + loss_lbbox[1]
+
+        with tf.name_scope('prob_loss'):
+            prob_loss = loss_sbbox[2] + loss_mbbox[2] + loss_lbbox[2]
+
+        return giou_loss, conf_loss, prob_loss
+
+
+
+                #tf.compat.v1.train.Saver().save(sess, 'ckpt/'+str(step)+'.ckpt')
+  
