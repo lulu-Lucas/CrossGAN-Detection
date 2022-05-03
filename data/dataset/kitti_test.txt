@@ -1,0 +1,1 @@
+F:/CODE/FusionGAN/VOC/JPEGImages/image_2/000003.png F:/CODE/FusionGAN/VOC/JPEGImages/depth/000003.png F:/CODE/FusionGAN/VOC/JPEGImages/intensity/000003.png 614,181,727,284,0 
