@@ -7,5 +7,5 @@ Paper：
 
 [2] Zhang H, Hua H. FusionGAN-Detection: vehicle detection based on 3D-LIDAR and color camera data[C]//Seventh Asia Pacific Conference on Optics Manufacture and 2021 International Forum of Young Scientists on Advanced Optical Manufacturing (APCOM and YSAOM 2021). SPIE, 2022, 12166: 347-352.
 
-E-MAIL:zhanghao3@sia.cn
+E-MAIL:zhanghao206@mails.ucas.ac.cn
 
